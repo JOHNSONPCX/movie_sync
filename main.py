@@ -6,6 +6,7 @@ import time
 import json
 import os
 import hashlib
+import random
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 
@@ -152,6 +153,8 @@ class VLCSync:
         self.missing_files: Dict[int, MediaFile] = {}
         self.sync_interval = 3  # Sync every 3 seconds
         self.last_sync_time = 0
+        self.shuffle_mode = False
+        self.end_reached_event = None
         
         if self.is_host:
             self.setup_server()
@@ -162,6 +165,29 @@ class VLCSync:
             self.load_playlist(folder_path)
                 
         self.start_sync_thread()
+        self.setup_end_reached_event()
+
+    def setup_end_reached_event(self):
+        self.end_reached_event = self.player.event_manager().event_attach(
+            vlc_module.EventType.MediaPlayerEndReached, self.on_end_reached
+        )
+
+    def on_end_reached(self, event):
+        if self.is_host:
+            self.play_next()
+
+    def play_next(self):
+        if self.shuffle_mode:
+            next_index = random.randint(0, len(self.playlist.media_files) - 1)
+        else:
+            current_index = self.playlist.current_index
+            next_index = (current_index + 1) % len(self.playlist.media_files)
+        
+        self.play_file(next_index)
+    
+    def toggle_shuffle(self):
+        self.shuffle_mode = not self.shuffle_mode
+        return self.shuffle_mode
 
     def setup_server(self):
         try:
@@ -302,6 +328,13 @@ class VLCSync:
         elif cmd_type == "request_sync":
             if self.is_host:
                 self.send_sync_command()
+        elif cmd_type == "toggle_shuffle":
+            if self.is_host:
+                new_state = self.toggle_shuffle()
+                self.broadcast_command({"type": "shuffle_state", "enabled": new_state})
+        elif cmd_type == "shuffle_state":
+            if not self.is_host:
+                self.shuffle_mode = command["enabled"]
         elif cmd_type == "ping":
             if self.is_host and client_socket:
                 self.send_command({"type": "pong"}, client_socket)
@@ -480,6 +513,8 @@ class VLCSync:
 
     def cleanup(self):
         self.running = False
+        if self.end_reached_event:
+            self.player.event_manager().event_detach(self.end_reached_event)
         if self.is_host:
             if self.server_socket:
                 self.server_socket.close()
@@ -527,6 +562,7 @@ def main():
             print("pause - Pause/resume the current file")
             print("seek <seconds> - Seek to a specific time")
             print("sync - Force synchronization with all clients")
+            print("shuffle - Toggle shuffle mode")
             print("quit - Exit the program")
 
             while True:
@@ -544,7 +580,7 @@ def main():
                         except ValueError:
                             print("Invalid file number")
                     elif cmd[0] == 'next':
-                        sync.next_file()
+                        sync.play_next()
                     elif cmd[0] == 'prev':
                         sync.previous_file()
                     elif cmd[0] == 'pause':
@@ -558,6 +594,9 @@ def main():
                     elif cmd[0] == 'sync':
                         sync.send_sync_command()
                         print("Sync command sent to all clients")
+                    elif cmd[0] == 'shuffle':
+                        new_state = sync.toggle_shuffle()
+                        print(f"Shuffle mode {'enabled' if new_state else 'disabled'}")
                     else:
                         print("Unknown command")
                 except Exception as e:
