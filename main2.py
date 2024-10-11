@@ -6,6 +6,7 @@ import time
 import json
 import os
 import hashlib
+import random
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 
@@ -150,6 +151,10 @@ class VLCSync:
         self.running = True
         self.sync_thread = None
         self.missing_files: Dict[int, MediaFile] = {}
+        self.sync_interval = 3  # Sync every 3 seconds
+        self.last_sync_time = 0
+        self.shuffle_mode = False
+        self.end_reached_event = None
         
         if self.is_host:
             self.setup_server()
@@ -160,6 +165,29 @@ class VLCSync:
             self.load_playlist(folder_path)
                 
         self.start_sync_thread()
+        self.setup_end_reached_event()
+
+    def setup_end_reached_event(self):
+        self.end_reached_event = self.player.event_manager().event_attach(
+            vlc_module.EventType.MediaPlayerEndReached, self.on_end_reached
+        )
+
+    def on_end_reached(self, event):
+        if self.is_host:
+            self.play_next()
+
+    def play_next(self):
+        if self.shuffle_mode:
+            next_index = random.randint(0, len(self.playlist.media_files) - 1)
+        else:
+            current_index = self.playlist.current_index
+            next_index = (current_index + 1) % len(self.playlist.media_files)
+        
+        self.play_file(next_index)
+
+    def toggle_shuffle(self):
+        self.shuffle_mode = not self.shuffle_mode
+        return self.shuffle_mode
 
     def setup_server(self):
         try:
@@ -276,15 +304,9 @@ class VLCSync:
         elif cmd_type == "play_file":
             file_index = command["index"]
             if self.verify_and_load_file(file_index):
-                if "time" in command:
-                    self.player.play()
-                    self.player.set_time(command["time"])
-                else:
-                    self.play()
+                self.play(command.get("time"))
         elif cmd_type == "play":
-            self.player.play()
-            if "time" in command:
-                self.player.set_time(command["time"])
+            self.play(command.get("time"))
         elif cmd_type == "pause":
             self.pause()
         elif cmd_type == "seek":
@@ -293,6 +315,16 @@ class VLCSync:
         elif cmd_type == "sync":
             if not self.is_host:
                 self.handle_sync(command)
+        elif cmd_type == "request_sync":
+            if self.is_host:
+                self.send_sync_command()
+        elif cmd_type == "toggle_shuffle":
+            if self.is_host:
+                new_state = self.toggle_shuffle()
+                self.broadcast_command({"type": "shuffle_state", "enabled": new_state})
+        elif cmd_type == "shuffle_state":
+            if not self.is_host:
+                self.shuffle_mode = command["enabled"]
         elif cmd_type == "ping":
             if self.is_host and client_socket:
                 self.send_command({"type": "pong"}, client_socket)
@@ -379,7 +411,9 @@ class VLCSync:
                 pass
         return 0
 
-    def play(self):
+    def play(self, time_ms=None):
+        if time_ms is not None:
+            self.player.set_time(time_ms)
         self.player.play()
         if self.is_host:
             time.sleep(0.1)  # Small delay to ensure playback has started
@@ -436,50 +470,51 @@ class VLCSync:
             self.send_command(command, client)
 
     def handle_sync(self, command):
-        if not self.is_host and self.player.is_playing():
+        if not self.is_host:
             host_time = command["time"]
-            current_time = self.player.get_time()
-            latency = self.measure_latency() / 2  # One-way latency
+            sync_time = command["sync_time"]
+            current_time = int(time.time() * 1000)  # Current time in milliseconds
             
-            # Adjust host_time by adding latency
-            adjusted_host_time = host_time + int(latency)
+            time_diff = current_time - sync_time
+            adjusted_host_time = host_time + time_diff
             
-            time_diff = current_time - adjusted_host_time
-            
-            if abs(time_diff) > 1000:  # More than 1 second out of sync
-                # Use regular seeking for large differences
-                self.player.set_time(adjusted_host_time)
-            elif abs(time_diff) > 100:  # Between 100ms and 1000ms
-                # Adjust playback speed
-                if time_diff > 0:
-                    # We're ahead, slow down
-                    self.player.set_rate(0.95)
-                else:
-                    # We're behind, speed up
-                    self.player.set_rate(1.05)
+            if self.player.is_playing():
+                current_player_time = self.player.get_time()
+                player_time_diff = current_player_time - adjusted_host_time
+                
+                if abs(player_time_diff) > 100:  # More than 100ms out of sync
+                    self.player.set_time(adjusted_host_time)
             else:
-                # We're in sync, reset to normal speed
-                self.player.set_rate(1.0)
+                # If not playing, just set the time
+                self.player.set_time(adjusted_host_time)
 
     def start_sync_thread(self):
         self.sync_thread = threading.Thread(target=self.sync_playback, daemon=True)
         self.sync_thread.start()
 
+    def send_sync_command(self):
+        if self.is_host and self.player.is_playing():
+            current_time = self.player.get_time()
+            sync_time = int(time.time() * 1000)  # Current time in milliseconds
+            self.broadcast_command({
+                "type": "sync",
+                "time": current_time,
+                "sync_time": sync_time
+            })
+
     def sync_playback(self):
-        SYNC_INTERVAL = 0.5  # Sync every 500ms
-        
         while self.running:
-            time.sleep(SYNC_INTERVAL)
-            
-            if self.is_host and self.player.is_playing():
-                current_time = self.player.get_time()
-                self.broadcast_command({
-                    "type": "sync",
-                    "time": current_time
-                })
+            current_time = time.time()
+            if current_time - self.last_sync_time >= self.sync_interval:
+                self.last_sync_time = current_time
+                if self.is_host:
+                    self.send_sync_command()
+            time.sleep(0.1)  # Sleep for a short time to reduce CPU usage
 
     def cleanup(self):
         self.running = False
+        if self.end_reached_event:
+            self.player.event_manager().event_detach(self.end_reached_event)
         if self.is_host:
             if self.server_socket:
                 self.server_socket.close()
@@ -526,6 +561,8 @@ def main():
             print("prev - Play the previous file")
             print("pause - Pause/resume the current file")
             print("seek <seconds> - Seek to a specific time")
+            print("sync - Force synchronization with all clients")
+            print("shuffle - Toggle shuffle mode")
             print("quit - Exit the program")
 
             while True:
@@ -543,7 +580,7 @@ def main():
                         except ValueError:
                             print("Invalid file number")
                     elif cmd[0] == 'next':
-                        sync.next_file()
+                        sync.play_next()
                     elif cmd[0] == 'prev':
                         sync.previous_file()
                     elif cmd[0] == 'pause':
@@ -554,6 +591,12 @@ def main():
                             sync.seek(int(seconds * 1000))
                         except ValueError:
                             print("Invalid seek time")
+                    elif cmd[0] == 'sync':
+                        sync.send_sync_command()
+                        print("Sync command sent to all clients")
+                    elif cmd[0] == 'shuffle':
+                        new_state = sync.toggle_shuffle()
+                        print(f"Shuffle mode {'enabled' if new_state else 'disabled'}")
                     else:
                         print("Unknown command")
                 except Exception as e:
@@ -564,6 +607,7 @@ def main():
             print("Connected to host. Waiting for playlist information...")
             
             print("\nAvailable commands:")
+            print("sync - Request synchronization from the host")
             print("quit - Exit the program")
             print("Playback is controlled by the host.")
             
@@ -571,6 +615,9 @@ def main():
                 cmd = input().lower()
                 if cmd == 'quit':
                     break
+                elif cmd == 'sync':
+                    sync.send_command({"type": "request_sync"}, sync.client_socket)
+                    print("Sync request sent to host")
     
     except KeyboardInterrupt:
         print("\nProgram interrupted by user")
